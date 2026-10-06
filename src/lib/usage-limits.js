@@ -2369,12 +2369,13 @@ function readClaudeLimitsCacheRaw({ home } = {}) {
 
 function readClaudeLimitsCache({
   home,
-  env,
   nowMs = Date.now(),
   maxAgeMs = CLAUDE_LIMITS_CACHE_MAX_AGE_MS,
   stale = true,
 } = {}) {
-  return normalizeClaudeCachedLimits(readNewestClaudeLimitsCacheRaw({ home, env }), { nowMs, maxAgeMs, stale });
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs, stale })
+  )));
 }
 
 // A cached snapshot stops being "fresh" the moment any of its windows crosses the
@@ -2419,19 +2420,14 @@ function claudeCacheAwaitsNewWindow(raw, { home, nowMs } = {}) {
 }
 
 // Claude Code keeps its last /api/oauth/usage response in its global config
-// (`cachedUsageUtilization` in ~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json).
-// That endpoint is throttled hard and its budget is shared with Claude Code itself,
-// so reading this copy costs no request. Only usage figures are read — no credentials.
-function resolveClaudeCodeGlobalConfigPath({ home, env = process.env } = {}) {
-  const configDir = typeof env?.CLAUDE_CONFIG_DIR === "string" ? env.CLAUDE_CONFIG_DIR.trim() : "";
-  if (configDir) return path.join(expandClaudeHome(configDir, home), ".claude.json");
+// (`cachedUsageUtilization` in ~/.claude.json). That endpoint is throttled hard and its
+// budget is shared with Claude Code itself, so reading this copy costs no request. Only
+// usage figures are read — no credentials. The path deliberately ignores CLAUDE_CONFIG_DIR:
+// readClaudeCodeOauthToken reads the default profile's credentials (default Keychain item,
+// ~/.claude/.credentials.json), and the cache must come from that same profile so it can
+// never describe a different account than the token this process would query with.
+function resolveClaudeCodeGlobalConfigPath({ home } = {}) {
   return path.join(home || os.homedir(), ".claude.json");
-}
-
-function expandClaudeHome(value, home) {
-  if (value === "~") return home || os.homedir();
-  if (value.startsWith("~/")) return path.join(home || os.homedir(), value.slice(2));
-  return value;
 }
 
 /**
@@ -2439,9 +2435,9 @@ function expandClaudeHome(value, home) {
  * or null when absent, unparsable, or recorded for a different account than the one
  * Claude Code is currently signed in to.
  */
-function readClaudeCodeUsageCacheRaw({ home, env } = {}) {
+function readClaudeCodeUsageCacheRaw({ home } = {}) {
   try {
-    const config = JSON.parse(fs.readFileSync(resolveClaudeCodeGlobalConfigPath({ home, env }), "utf8"));
+    const config = JSON.parse(fs.readFileSync(resolveClaudeCodeGlobalConfigPath({ home }), "utf8"));
     const cached = config?.cachedUsageUtilization;
     const fetchedAtMs = Number(cached?.fetchedAtMs);
     if (!cached?.utilization || typeof cached.utilization !== "object" || !Number.isFinite(fetchedAtMs)) return null;
@@ -2454,28 +2450,29 @@ function readClaudeCodeUsageCacheRaw({ home, env } = {}) {
   }
 }
 
-/** The newer of our own disk cache and Claude Code's cached usage. */
-function readNewestClaudeLimitsCacheRaw({ home, env } = {}) {
-  const own = readClaudeLimitsCacheRaw({ home });
-  const claudeCode = readClaudeCodeUsageCacheRaw({ home, env });
-  if (!own || !claudeCode) return own || claudeCode;
-  const ownMs = parseTimeMs(own.cached_at);
-  const claudeCodeMs = parseTimeMs(claudeCode.cached_at);
-  if (!Number.isFinite(claudeCodeMs)) return own;
-  if (!Number.isFinite(ownMs)) return claudeCode;
-  return claudeCodeMs > ownMs ? claudeCode : own;
+/** Raw snapshots from both sources: our own disk cache and Claude Code's cached read. */
+function readClaudeLimitsCacheCandidates({ home } = {}) {
+  return [readClaudeLimitsCacheRaw({ home }), readClaudeCodeUsageCacheRaw({ home })].filter(Boolean);
 }
 
-function readFreshClaudeLimitsCache({ home, env, nowMs = Date.now() } = {}) {
-  const raw = readNewestClaudeLimitsCacheRaw({ home, env });
-  if (!raw || claudeCacheCrossedReset(raw, { nowMs }) || claudeCacheAwaitsNewWindow(raw, { home, nowMs })) {
-    return null;
+/** Newest of the already-validated snapshots, by cached_at. */
+function pickNewestClaudeSnapshot(snapshots) {
+  let newest = null;
+  for (const snapshot of snapshots) {
+    if (!snapshot) continue;
+    if (!newest || parseTimeMs(snapshot.cached_at) > parseTimeMs(newest.cached_at)) newest = snapshot;
   }
-  return normalizeClaudeCachedLimits(raw, {
-    nowMs,
-    maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS,
-    stale: false,
-  });
+  return newest;
+}
+
+// Each source is validated on its own before picking the newest, so a newer snapshot
+// whose windows are all unusable can never displace an older usable one.
+function readFreshClaudeLimitsCache({ home, nowMs = Date.now() } = {}) {
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    claudeCacheCrossedReset(raw, { nowMs }) || claudeCacheAwaitsNewWindow(raw, { home, nowMs })
+      ? null
+      : normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS, stale: false })
+  )));
 }
 
 function writeClaudeLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
@@ -3899,7 +3896,7 @@ async function fetchUsageLimitsUncached({
   // through this cache — but never through the 429 cooldown above, which is exactly the
   // hammering the cooldown exists to prevent.
   const freshClaudeCache = claudeToken && !forceRefresh
-    ? readFreshClaudeLimitsCache({ home, env, nowMs })
+    ? readFreshClaudeLimitsCache({ home, nowMs })
     : null;
 
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
@@ -4080,7 +4077,7 @@ async function fetchUsageLimitsUncached({
         tokenExpiresAtMs: claudeTokenExpiresAtMs,
       });
     }
-    const cached = readClaudeLimitsCache({ home, env, nowMs });
+    const cached = readClaudeLimitsCache({ home, nowMs });
     if (cached) {
       claude = cached;
     } else {

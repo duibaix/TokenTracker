@@ -659,7 +659,14 @@ describe("getUsageLimits reads Claude Code's cached usage", () => {
   }
 
   /** Write Claude Code's global config with a cached /api/oauth/usage body. */
-  function writeClaudeCodeConfig(dir, { fetchedAtMs, fiveHour, cachedAccount = ACCOUNT, currentAccount = ACCOUNT }) {
+  function writeClaudeCodeConfig(dir, {
+    fetchedAtMs,
+    fiveHour,
+    cachedAccount = ACCOUNT,
+    currentAccount = ACCOUNT,
+    fiveHourResetMs = Date.now() + 3_600_000,
+    sevenDayResetMs = Date.now() + 86_400_000,
+  }) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({
       oauthAccount: { accountUuid: currentAccount },
@@ -667,8 +674,8 @@ describe("getUsageLimits reads Claude Code's cached usage", () => {
         fetchedAtMs,
         accountUuid: cachedAccount,
         utilization: {
-          five_hour: { utilization: fiveHour, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-          seven_day: { utilization: 12, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+          five_hour: { utilization: fiveHour, resets_at: new Date(fiveHourResetMs).toISOString() },
+          seven_day: { utilization: 12, resets_at: new Date(sevenDayResetMs).toISOString() },
           limits: [],
         },
       },
@@ -775,18 +782,46 @@ describe("getUsageLimits reads Claude Code's cached usage", () => {
     }
   });
 
-  it("reads the cached usage from $CLAUDE_CONFIG_DIR when it is set", async () => {
+  it("stays on the token's profile and ignores a $CLAUDE_CONFIG_DIR copy", async () => {
     resetUsageLimitsCache();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-limits-claude-code-configdir-"));
     try {
       writeClaudeCreds(tmp, "sk-ant-oauth-cc-configdir");
+      const ownCachedAt = new Date(Date.now() - 3 * 3_600_000).toISOString();
+      writeOwnCache(tmp, { cachedAt: ownCachedAt, fiveHour: 70 });
+      // The token comes from the default profile, so another profile's cache must not be used.
       const configDir = path.join(tmp, "alt-claude");
-      writeClaudeCodeConfig(configDir, { fetchedAtMs: Date.now() - 60 * 60 * 1000, fiveHour: 21 });
+      writeClaudeCodeConfig(configDir, { fetchedAtMs: Date.now() - 60 * 1000, fiveHour: 21 });
 
       const result = await run(tmp, rateLimited, { env: { CLAUDE_CONFIG_DIR: configDir } });
 
+      assert.equal(result.claude.five_hour.utilization, 70);
+      assert.equal(result.claude.cached_at, ownCachedAt);
+    } finally {
+      resetUsageLimitsCache();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an older usable cache when Claude Code's newer read has only expired windows", async () => {
+    resetUsageLimitsCache();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-limits-claude-code-expired-"));
+    try {
+      writeClaudeCreds(tmp, "sk-ant-oauth-cc-expired");
+      const ownCachedAt = new Date(Date.now() - 3 * 3_600_000).toISOString();
+      writeOwnCache(tmp, { cachedAt: ownCachedAt, fiveHour: 64 });
+      writeClaudeCodeConfig(tmp, {
+        fetchedAtMs: Date.now() - 60 * 60 * 1000,
+        fiveHour: 2,
+        fiveHourResetMs: Date.now() - 60 * 1000,
+        sevenDayResetMs: Date.now() - 60 * 1000,
+      });
+
+      const result = await run(tmp, rateLimited);
+
       assert.equal(result.claude.error, null);
-      assert.equal(result.claude.five_hour.utilization, 21);
+      assert.equal(result.claude.five_hour.utilization, 64);
+      assert.equal(result.claude.cached_at, ownCachedAt);
     } finally {
       resetUsageLimitsCache();
       fs.rmSync(tmp, { recursive: true, force: true });
